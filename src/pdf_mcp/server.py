@@ -25,7 +25,9 @@ import httpx
 from .backend.geometry import Rect as GeomRect
 from .docopen import open_pdf
 from fastmcp import FastMCP
-from mcp.types import ImageContent
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.tools.base import ToolResult
+from mcp.types import CallToolRequestParams, ImageContent
 from pydantic import BeforeValidator
 
 from . import __version__
@@ -146,6 +148,268 @@ mcp = FastMCP(
         "means unknown (timed out), not zero."
     ),
 )
+
+# ============================================================================
+# Tool-call argument normalization
+# ============================================================================
+#
+# Some MCP clients guess argument names instead of reading the advertised
+# inputSchema — pdf_info arrives with `file_path`, pdf_render_pages with
+# `page_numbers` as a JSON array, camelCase variants, and so on (observed
+# in the wild from agents whose harness never shows the schema to the
+# model). The pydantic validation error is correct but expensive: it costs
+# the client a retry round-trip, and some agents never recover. The
+# middleware below rewrites obviously-meant arguments before validation —
+# common alias names map onto each tool's canonical parameters, and a few
+# lossless value coercions are applied ([1] -> "1" for `pages`, "true" ->
+# True for booleans, stringified JSON for array/object params). Anything
+# that can't be mapped is left untouched so pydantic still reports the real
+# error, and a canonical key the caller explicitly provided is never
+# overwritten by an alias. The advertised schema is unchanged: strict
+# clients see exactly the same contract as before.
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _snake_case(name: str) -> str:
+    """filePath -> file_path, pageNumbers -> page_numbers, URL -> url."""
+    return _CAMEL_BOUNDARY.sub("_", name).lower()
+
+
+# Guessed name -> canonical candidates, tried in order against the called
+# tool's actual parameters. `path`/`paths` appear in both directions so a
+# singular guess aimed at a corpus tool (and a plural guess aimed at a
+# single-document tool) both land. `page`/`pages` likewise resolve by which
+# of the two the tool actually takes.
+_ARG_ALIASES: dict[str, tuple[str, ...]] = {
+    "path": ("path", "paths"),
+    "paths": ("paths", "path"),
+    "file_path": ("path", "paths"),
+    "filepath": ("path", "paths"),
+    "file_name": ("path", "paths"),
+    "filename": ("path", "paths"),
+    "absolute_path": ("path", "paths"),
+    "full_path": ("path", "paths"),
+    "pdf_path": ("path", "paths"),
+    "pdf_file": ("path", "paths"),
+    "doc_path": ("path", "paths"),
+    "document_path": ("path", "paths"),
+    "document": ("path", "paths"),
+    "file": ("path", "paths"),
+    "pdf": ("path", "paths"),
+    "source": ("path", "paths"),
+    "url": ("path", "paths"),  # `path` already accepts URLs
+    "uri": ("path", "paths"),
+    "file_paths": ("paths", "path"),
+    "files": ("paths", "path"),
+    "documents": ("paths", "path"),
+    "directory": ("paths", "path"),
+    "folder": ("paths", "path"),
+    "page": ("page", "pages"),
+    "pages": ("pages", "page"),
+    "page_number": ("page", "pages"),
+    "page_numbers": ("pages", "page"),
+    "page_range": ("pages",),
+    "page_ranges": ("pages",),
+    "page_list": ("pages",),
+    "pages_list": ("pages",),
+    "page_spec": ("pages",),
+    "page_specification": ("pages",),
+    "range": ("pages",),
+    "ranges": ("pages",),
+    "q": ("query",),
+    "query_text": ("query",),
+    "search_query": ("query",),
+    "search_term": ("query",),
+    "term": ("query",),
+    "search_mode": ("mode",),
+    "limit": ("max_results", "top_k", "max_pages"),
+    "num_results": ("max_results", "top_k"),
+    "num_pages": ("max_pages",),
+    "k": ("top_k",),
+    "render_dpi": ("render_dpi", "dpi"),
+    "resolution": ("dpi", "render_dpi"),
+    "ocr_language": ("ocr_lang",),
+    "language": ("ocr_lang",),
+    "lang": ("ocr_lang",),
+    "use_ocr": ("ocr",),
+    "budget": ("budget_seconds",),
+    "timeout": ("budget_seconds",),
+    "window": ("window_tokens",),
+    "window_size": ("window_tokens",),
+    "num_points": ("max_points",),
+    "context_size": ("context_chars",),
+    "context_length": ("context_chars",),
+    "start": ("start_page",),
+    "first_page": ("start_page",),
+}
+
+
+def _schema_types(prop: dict[str, Any]) -> set[str]:
+    """Collect the JSON-schema primitive types a property accepts,
+    including through anyOf/oneOf combinators (e.g. array|null)."""
+    types: set[str] = set()
+    declared = prop.get("type")
+    if isinstance(declared, str):
+        types.add(declared)
+    elif isinstance(declared, list):
+        types.update(t for t in declared if isinstance(t, str))
+    for combinator in ("anyOf", "oneOf"):
+        for sub in prop.get(combinator) or []:
+            if isinstance(sub, dict):
+                types.update(_schema_types(sub))
+    return types
+
+
+def _coerce_tool_arg(name: str, value: Any, types: set[str]) -> Any:
+    """Apply lossless coercions to a value sent with the wrong JSON type.
+
+    Anything unrecognized is returned unchanged so pydantic still raises
+    its normal, informative type error.
+    """
+    if isinstance(value, bool):
+        # Never reinterpret a real bool — and keep bools out of the
+        # int/float branches below (isinstance(True, int) is True).
+        return value
+
+    if "string" in types and not isinstance(value, str):
+        # `pages` takes a "1-3,5" spec; a JSON array of page numbers — or
+        # a bare integer — carries the same meaning.
+        if name == "pages" and isinstance(value, (list, tuple)):
+            parts = []
+            for v in value:
+                if isinstance(v, bool) or isinstance(v, (dict, list, tuple)):
+                    return value
+                parts.append(
+                    str(int(v))
+                    if isinstance(v, (int, float)) and float(v).is_integer()
+                    else str(v)
+                )
+            return ",".join(parts)
+        # A one-element (or mistaken multi-element) list aimed at a
+        # single-document `path` parameter: the model meant "this file".
+        if name == "path" and isinstance(value, (list, tuple)):
+            return value[0] if value else value
+        if isinstance(value, (int, float)):
+            return str(int(value)) if float(value).is_integer() else str(value)
+        return value
+
+    if "integer" in types:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if re.fullmatch(r"-?\d+", stripped):
+                return int(stripped)
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+
+    if "number" in types and isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+
+    if "boolean" in types and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no"):
+            return False
+        return value
+
+    # Stringified JSON for array/object params (clip, hints). _ClipArg's
+    # BeforeValidator already does this for `clip`; covering every
+    # array/object parameter here keeps the tolerance uniform.
+    if isinstance(value, str) and ("array" in types or "object" in types):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+
+    return value
+
+
+def _normalize_tool_args(
+    properties: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Map guessed argument names onto canonical params and coerce values.
+
+    `properties` is the tool's advertised inputSchema `properties` dict —
+    the canonical names and per-param schemas drive both renaming and
+    coercion, so new tools are covered without touching the alias table.
+    """
+    canonical = set(properties)
+    normalized: dict[str, Any] = {}
+    for key, value in arguments.items():
+        target: str | None = key if key in canonical else None
+        if target is None:
+            snake = _snake_case(key)
+            if snake in canonical:
+                target = snake
+            else:
+                for candidate in _ARG_ALIASES.get(snake, _ARG_ALIASES.get(key, ())):
+                    if candidate in canonical:
+                        target = candidate
+                        break
+        # A rename must not shadow a canonical key the caller already sent
+        # (or a previous alias that already claimed it): leave the key as-is
+        # so validation flags the conflict instead of silently picking one.
+        if (
+            target is not None
+            and target != key
+            and (target in arguments or target in normalized)
+        ):
+            target = None
+        out_key = target if target is not None else key
+        prop = properties.get(out_key)
+        types = _schema_types(prop) if isinstance(prop, dict) else set()
+        normalized[out_key] = _coerce_tool_arg(out_key, value, types)
+    return normalized
+
+
+class _ToolArgNormalizationMiddleware(Middleware):
+    """Rewrite guessed argument names/types onto the canonical schema.
+
+    Runs on every tools/call before FastMCP validates arguments. See the
+    block comment above _CAMEL_BOUNDARY for rationale.
+    """
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        msg = context.message
+        args = getattr(msg, "arguments", None)
+        # A client that serialized the whole arguments object as a string.
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                msg.arguments = parsed
+                args = parsed
+        if isinstance(args, dict) and args:
+            try:
+                tool = await mcp.get_tool(msg.name)
+            except Exception:
+                tool = None
+            properties = (getattr(tool, "parameters", None) or {}).get("properties")
+            if isinstance(properties, dict):
+                rewritten = _normalize_tool_args(properties, args)
+                if rewritten != args:
+                    logger.debug(
+                        "normalized arguments for %s: %r -> %r",
+                        msg.name,
+                        args,
+                        rewritten,
+                    )
+                    msg.arguments = rewritten
+        return await call_next(context)
+
+
+mcp.add_middleware(_ToolArgNormalizationMiddleware())
 
 _DEFAULT_CACHE_TTL_HOURS = 24
 _MAX_CACHE_TTL_HOURS = 8760  # one year

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tool-call argument normalization for clients that guess parameter
+  names.** A FastMCP middleware now rewrites `tools/call` arguments before
+  pydantic validation: common guessed names (`file_path`, `page_numbers`,
+  camelCase variants, `q`, `path` aimed at a corpus tool's `paths`, and
+  friends) map onto each tool's canonical parameters, and a few lossless
+  coercions are applied (`pages` given as `[1]` or `3` becomes `"1"` /
+  `"3"`, `"true"` becomes `True`, stringified JSON parses for
+  array/object params like `clip`). Agent harnesses that never show the
+  model the advertised inputSchema — observed in the wild producing
+  `missing_argument`/`unexpected_keyword_argument` failures on
+  `pdf_info`/`pdf_render_pages` — now succeed on the first call instead
+  of burning retry round-trips. Anything unmappable is left untouched so
+  validation still reports the real error, and a canonical key the caller
+  explicitly sent is never overwritten by an alias. The advertised schema
+  is unchanged: strict clients see the same contract as before.
+
 - **Optional CUDA acceleration for embedding, off by default.** Set
   `PDF_MCP_CUDA=1` with the CUDA build of onnxruntime installed and the
   embedding pass runs on the GPU (one to two orders of magnitude faster on
